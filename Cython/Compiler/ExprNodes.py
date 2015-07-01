@@ -158,6 +158,25 @@ def infer_sequence_item_type(env, seq_node, index_node=None, seq_type=None):
             return item_types.pop()
     return None
 
+def translate_cpp_exception(code, pos, inside, exception_value, nogil):
+    if exception_value is None:
+        raise_py_exception = "__Pyx_CppExn2PyErr();"
+    elif exception_value.type.is_pyobject:
+        raise_py_exception = 'try { throw; } catch(const std::exception& exn) { PyErr_SetString(%s, exn.what()); } catch(...) { PyErr_SetNone(%s); }' % (
+            exception_value.entry.cname,
+            exception_value.entry.cname)
+    else:
+        raise_py_exception = '%s(); if (!PyErr_Occurred()) PyErr_SetString(PyExc_RuntimeError , "Error converting c++ exception.");' % exception_value.entry.cname
+    code.putln("try {")
+    code.putln("%s;" % inside)
+    code.putln("} catch(...) {")
+    if nogil:
+        code.put_ensure_gil(declare_gilstate=True)
+    code.putln(raise_py_exception)
+    if nogil:
+        code.put_release_ensured_gil()
+    code.putln(code.error_goto(pos))
+    code.putln("}")
 
 class ExprNode(Node):
     #  subexprs     [string]     Class var holding names of subexpr node attrs
@@ -4961,24 +4980,8 @@ class SimpleCallNode(CallNode):
                 else:
                     lhs = ""
                 if func_type.exception_check == '+':
-                    if func_type.exception_value is None:
-                        raise_py_exception = "__Pyx_CppExn2PyErr();"
-                    elif func_type.exception_value.type.is_pyobject:
-                        raise_py_exception = 'try { throw; } catch(const std::exception& exn) { PyErr_SetString(%s, exn.what()); } catch(...) { PyErr_SetNone(%s); }' % (
-                            func_type.exception_value.entry.cname,
-                            func_type.exception_value.entry.cname)
-                    else:
-                        raise_py_exception = '%s(); if (!PyErr_Occurred()) PyErr_SetString(PyExc_RuntimeError , "Error converting c++ exception.");' % func_type.exception_value.entry.cname
-                    code.putln("try {")
-                    code.putln("%s%s;" % (lhs, rhs))
-                    code.putln("} catch(...) {")
-                    if self.nogil:
-                        code.put_ensure_gil(declare_gilstate=True)
-                    code.putln(raise_py_exception)
-                    if self.nogil:
-                        code.put_release_ensured_gil()
-                    code.putln(code.error_goto(self.pos))
-                    code.putln("}")
+                    translate_cpp_exception(code, self.pos, '%s%s;' % (lhs, rhs),
+                                            func_type.exception_value, self.nogil)
                 else:
                     if exc_checks:
                         goto_error = code.error_goto_if(" && ".join(exc_checks), self.pos)
@@ -9860,6 +9863,12 @@ class BinopNode(ExprNode):
             self.type_error()
             return
         func_type = entry.type
+        self.exception_check = func_type.exception_check
+        self.exception_value = func_type.exception_value
+        if self.exception_check == '+':
+            # Used by NumBinopNodes to break up expressions involving multiple
+            # operators so that exceptions can be handled properly.
+            self.is_temp = 1
         if func_type.is_ptr:
             func_type = func_type.base_type
         if len(func_type.args) == 1:
@@ -9926,7 +9935,14 @@ class BinopNode(ExprNode):
                     code.error_goto_if_null(self.result(), self.pos)))
             code.put_gotref(self.py_result())
         elif self.is_temp:
-            code.putln("%s = %s;" % (self.result(), self.calculate_result_code()))
+            # C++ overloaded operators with exception values are currently all
+            # handled through temporaries.
+            if self.is_cpp_operation() and self.exception_check == '+':
+                translate_cpp_exception(code, self.pos,
+                                        "%s = %s;" % (self.result(), self.calculate_result_code()),
+                                        self.exception_value, self.in_nogil_context)
+            else:
+                code.putln("%s = %s;" % (self.result(), self.calculate_result_code()))
 
     def type_error(self):
         if not (self.operand1.type.is_error
@@ -10064,7 +10080,7 @@ class NumBinopNode(BinopNode):
                 self.operand1.result(),
                 self.operand2.result(),
                 self.overflow_bit_node.overflow_bit)
-        elif self.infix:
+        elif self.type.is_cpp_class or self.infix:
             return "(%s %s %s)" % (
                 self.operand1.result(),
                 self.operator,
