@@ -3841,6 +3841,10 @@ class IndexNode(ExprNode):
         elif self.base.type is bytearray_type:
             value_code = self._check_byte_value(code, rhs)
             self.generate_setitem_code(value_code, code)
+        elif self.base.type.is_cpp_class and self.exception_check:
+            translate_cpp_exception(code, self.pos,
+                "%s = %s;" % (self.result(), rhs.result()),
+                self.exception_value, self.in_nogil_context)
         else:
             code.putln(
                 "%s = %s;" % (
